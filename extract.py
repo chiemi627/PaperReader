@@ -7,12 +7,13 @@
 
 主な処理:
 1. PyMuPDF で本文を抽出（2段組対応のためブロック順を y, x でソート）
-2. ヘッダー・フッター（ページ番号・誌名等）を除去
-3. 行末ハイフネーション結合（英語論文用）
-4. 引用番号 [1], [2,3], (Smith 2020) 等を削除
-5. 図表キャプション (Figure 1, 図 1, Table 2 等で始まる段落) を除去
-6. 参考文献セクション以降を切り落とし
-7. 数式記号の多い行を除去
+2. 図領域 (ラスター画像 + ベクトル描画クラスタ) を検出し、図内のテキストを除外
+3. ヘッダー・フッター（ページ番号・誌名等）を除去
+4. 行末ハイフネーション結合（英語論文用）
+5. 引用番号 [1], [2,3], (Smith 2020) 等を削除
+6. 図表キャプション (Figure 1, 図 1, Table 2 等で始まる段落) を除去
+7. 参考文献セクション以降を切り落とし
+8. 数式記号の多い行を除去
 """
 
 import argparse
@@ -110,6 +111,114 @@ NUMBERED_SECTION = re.compile(
 )
 
 
+def get_figure_regions(page) -> list:
+    """ページ内の図領域 (ラスター画像 + ベクトル描画クラスタ) を検出.
+
+    返るのは fitz.Rect のリスト。テキストブロックがこの矩形と大きく重なれば
+    図中のラベル等とみなしてスキップする。
+    """
+    regions: list = []
+
+    # 1) ラスター画像
+    try:
+        for info in page.get_image_info(xrefs=True):
+            bbox = info.get("bbox")
+            if bbox:
+                regions.append(fitz.Rect(bbox))
+    except Exception:
+        pass
+
+    # 2) ベクトル描画 (アーキテクチャ図, プロット等)
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        drawings = []
+
+    drawing_items: list[tuple] = []
+    for d in drawings:
+        r = d.get("rect")
+        if r is None:
+            continue
+        rect = fitz.Rect(r)
+        # ごく細い線 (罫線, 下線) はスキップ
+        if rect.width < 3 and rect.height < 3:
+            continue
+        has_curve = any(item and item[0] == "c" for item in d.get("items", []))
+        drawing_items.append((rect, has_curve))
+
+    # 性能の安全弁
+    if len(drawing_items) > 3000:
+        drawing_items = drawing_items[:3000]
+
+    for rect, curve_count, total in _cluster_drawings(drawing_items, gap=15.0):
+        if rect.width < 50 or rect.height < 50:
+            continue
+        # 曲線を含むクラスタは図とみなす (テーブルは直線のみで構成されることが多い)
+        if curve_count > 0:
+            regions.append(rect)
+        # 曲線がなくても要素数が多くサイズが大きければ図とみなす
+        elif total >= 20 and rect.width >= 100 and rect.height >= 80:
+            regions.append(rect)
+    return regions
+
+
+def _cluster_drawings(items, gap: float):
+    """gap だけ膨張させた矩形が交差する描画要素をクラスタに統合.
+
+    Returns:
+        [(merged_rect, curve_count, total_count), ...]
+    """
+    if not items:
+        return []
+    n = len(items)
+    used = [False] * n
+    clusters = []
+    for i in range(n):
+        if used[i]:
+            continue
+        used[i] = True
+        rect = fitz.Rect(items[i][0])
+        curves = 1 if items[i][1] else 0
+        total = 1
+        while True:
+            expanded = fitz.Rect(rect.x0 - gap, rect.y0 - gap,
+                                 rect.x1 + gap, rect.y1 + gap)
+            added = False
+            for j in range(n):
+                if used[j]:
+                    continue
+                if expanded.intersects(items[j][0]):
+                    rect |= items[j][0]
+                    if items[j][1]:
+                        curves += 1
+                    total += 1
+                    used[j] = True
+                    added = True
+            if not added:
+                break
+        clusters.append((rect, curves, total))
+    return clusters
+
+
+def _block_overlap_ratio(b, regions) -> float:
+    """ブロック b の面積のうち、いずれかの図領域と重なっている割合の最大値."""
+    if not regions:
+        return 0.0
+    bbox = fitz.Rect(b[0], b[1], b[2], b[3])
+    area = bbox.get_area()
+    if area <= 0:
+        return 0.0
+    max_ratio = 0.0
+    for r in regions:
+        inter = bbox & r
+        if inter.is_empty:
+            continue
+        ratio = inter.get_area() / area
+        if ratio > max_ratio:
+            max_ratio = ratio
+    return max_ratio
+
+
 def extract_blocks(pdf_path: Path) -> tuple[list[str], list[str]]:
     """PyMuPDF で各ページからテキストブロックを抽出.
 
@@ -128,15 +237,23 @@ def extract_blocks(pdf_path: Path) -> tuple[list[str], list[str]]:
         header_y = height * 0.08
         footer_y = height * 0.92
 
+        figure_regions = get_figure_regions(page)
+
         blocks = page.get_text("blocks")
         text_blocks = [b for b in blocks if b[6] == 0]
 
-        # 位置によるヘッダー・フッター分離
+        # 位置によるヘッダー・フッター分離 / 図内テキストの除外
         body_blocks = []
         for b in text_blocks:
             y0, y1 = b[1], b[3]
             text = b[4].strip()
             if not text:
+                continue
+            # 図領域に大きく重なるブロックは図中のラベル等 → 除外
+            if _block_overlap_ratio(b, figure_regions) > 0.5:
+                continue
+            # 図表キャプション (Figure 1, 図 1, Table 2 ...) → 除外
+            if CAPTION_START.match(text):
                 continue
             # 短い行 & 上下端 → ヘッダー/フッター候補
             if len(text) < 100 and "\n" not in text and (y1 < header_y or y0 > footer_y):
