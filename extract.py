@@ -7,12 +7,13 @@
 
 主な処理:
 1. PyMuPDF で本文を抽出（2段組対応のためブロック順を y, x でソート）
-2. ヘッダー・フッター（ページ番号・誌名等）を除去
-3. 行末ハイフネーション結合（英語論文用）
-4. 引用番号 [1], [2,3], (Smith 2020) 等を削除
-5. 図表キャプション (Figure 1, 図 1, Table 2 等で始まる段落) を除去
-6. 参考文献セクション以降を切り落とし
-7. 数式記号の多い行を除去
+2. 図領域 (ラスター画像 + ベクトル描画クラスタ) を検出し、図内のテキストを除外
+3. ヘッダー・フッター（ページ番号・誌名等）を除去
+4. 行末ハイフネーション結合（英語論文用）
+5. 引用番号 [1], [2,3], (Smith 2020) 等を削除
+6. 図表キャプション (Figure 1, 図 1, Table 2 等で始まる段落) を除去
+7. 参考文献セクション以降を切り落とし
+8. 数式記号の多い行を除去
 """
 
 import argparse
@@ -110,11 +111,225 @@ NUMBERED_SECTION = re.compile(
 )
 
 
+def get_figure_regions(page) -> list:
+    """ページ内の図表領域を検出.
+
+    返るのは fitz.Rect のリスト。テキストブロックがこの矩形と大きく重なれば
+    図表内の断片とみなしてスキップする。
+    対象:
+      - ラスター画像
+      - PyMuPDF の table finder が検出したテーブル
+      - ベクトル描画クラスタ (アーキテクチャ図, プロット, 線画)
+    """
+    regions: list = []
+
+    # 1) ラスター画像
+    try:
+        for info in page.get_image_info(xrefs=True):
+            bbox = info.get("bbox")
+            if bbox:
+                regions.append(fitz.Rect(bbox))
+    except Exception:
+        pass
+
+    # 2) テーブル (PyMuPDF 内蔵の table finder; 1.23+)
+    #    罫線で構成されたテーブルはベクトル描画判定をすり抜けやすいので、
+    #    専用の検出器に任せる。各セルが小さなテキストブロックとして抽出されると
+    #    読み上げが破綻するため、本文からは除外する。
+    #    検出された bbox はヘッダー行を取りこぼすことがあるので少し膨らませる。
+    try:
+        finder = page.find_tables()
+        tables = getattr(finder, "tables", None)
+        if tables is None:
+            try:
+                tables = list(finder)
+            except TypeError:
+                tables = []
+        for t in tables:
+            bbox = getattr(t, "bbox", None)
+            if bbox is not None:
+                rect = fitz.Rect(bbox)
+                regions.append(fitz.Rect(
+                    rect.x0 - 5, rect.y0 - 20, rect.x1 + 5, rect.y1 + 5
+                ))
+    except Exception:
+        pass
+
+    # 3) ベクトル描画 (アーキテクチャ図, プロット等)
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        drawings = []
+
+    # 3a) 水平罫線ペアからのテーブル検出 (find_tables の取りこぼし対策).
+    #     同じ x 範囲 (50% 以上重なり) かつ垂直距離 <= 50pt の細い水平線を
+    #     クラスタし、2 本以上集まればテーブル領域とする。
+    regions.extend(_detect_rule_tables(drawings, page))
+
+    drawing_items: list[tuple] = []
+    page_w, page_h = page.rect.width, page.rect.height
+    for d in drawings:
+        r = d.get("rect")
+        if r is None:
+            continue
+        rect = fitz.Rect(r)
+        # ごく細い線 (罫線, 下線) はスキップ
+        if rect.width < 3 and rect.height < 3:
+            continue
+        items_list = d.get("items", [])
+        # 単一要素で巨大な矩形は背景フィル/クリップ領域とみなしてスキップ
+        # (これを残すと他の描画要素を全て巻き込んで巨大クラスタができ、
+        # 見出しや本文まで図領域に飲み込まれてしまう)
+        if len(items_list) <= 1 and (
+            rect.width > page_w * 0.7 or rect.height > page_h * 0.5
+        ):
+            continue
+        has_curve = any(item and item[0] == "c" for item in items_list)
+        drawing_items.append((rect, has_curve))
+
+    # 性能の安全弁
+    if len(drawing_items) > 3000:
+        drawing_items = drawing_items[:3000]
+
+    for rect, curve_count, total in _cluster_drawings(drawing_items, gap=15.0):
+        # ページ全体を覆うような枠は除外
+        if rect.width >= page_w * 0.9 and rect.height >= page_h * 0.9:
+            continue
+        if rect.width < 50 or rect.height < 50:
+            continue
+        is_figure = curve_count > 0 or (
+            total >= 20 and rect.width >= 100 and rect.height >= 80
+        )
+        if not is_figure:
+            continue
+        # 図領域の周辺ラベル (パネル間の見出し, サブ図の名前等) を
+        # 取りこぼさないよう少し膨らませる
+        regions.append(fitz.Rect(
+            rect.x0 - 5, rect.y0 - 12, rect.x1 + 5, rect.y1 + 18
+        ))
+    return regions
+
+
+def _detect_rule_tables(drawings, page) -> list:
+    """水平罫線パターンからテーブル領域を検出.
+
+    高さ < 3pt, 幅 >= 40pt の細い水平線のうち、x 範囲が 50% 以上重なり
+    かつ垂直距離が 50pt 以内のものをユニオンファインドでまとめ、
+    2 本以上集まったクラスタの外接矩形を返す。
+    """
+    h_rules: list = []
+    for d in drawings:
+        r = d.get("rect")
+        if r is None:
+            continue
+        rect = fitz.Rect(r)
+        if rect.height >= 3 or rect.width < 40:
+            continue
+        h_rules.append(rect)
+
+    n = len(h_rules)
+    if n < 2:
+        return []
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    vert_gap = 50.0
+    for i in range(n):
+        ri = h_rules[i]
+        ci_y = (ri.y0 + ri.y1) / 2
+        for j in range(i + 1, n):
+            rj = h_rules[j]
+            x_overlap = min(ri.x1, rj.x1) - max(ri.x0, rj.x0)
+            if x_overlap <= 0:
+                continue
+            min_w = min(ri.width, rj.width)
+            if x_overlap < 0.5 * min_w:
+                continue
+            if abs(ci_y - (rj.y0 + rj.y1) / 2) > vert_gap:
+                continue
+            union(i, j)
+
+    groups: dict = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(h_rules[i])
+
+    regions: list = []
+    page_h = page.rect.height
+    for rules in groups.values():
+        if len(rules) < 2:
+            continue
+        x0 = min(r.x0 for r in rules)
+        y0 = min(r.y0 for r in rules)
+        x1 = max(r.x1 for r in rules)
+        y1 = max(r.y1 for r in rules)
+        if (y1 - y0) < 5:
+            continue
+        if (y1 - y0) > page_h * 0.8:
+            continue
+        # ヘッダー行を取りこぼさないよう垂直方向に少し余裕を持たせる
+        regions.append(fitz.Rect(x0 - 3, y0 - 18, x1 + 3, y1 + 3))
+    return regions
+
+
+def _cluster_drawings(items, gap: float):
+    """gap だけ膨張させた矩形が交差する描画要素をクラスタに統合.
+
+    Returns:
+        [(merged_rect, curve_count, total_count), ...]
+    """
+    if not items:
+        return []
+    n = len(items)
+    used = [False] * n
+    clusters = []
+    for i in range(n):
+        if used[i]:
+            continue
+        used[i] = True
+        rect = fitz.Rect(items[i][0])
+        curves = 1 if items[i][1] else 0
+        total = 1
+        while True:
+            expanded = fitz.Rect(rect.x0 - gap, rect.y0 - gap,
+                                 rect.x1 + gap, rect.y1 + gap)
+            added = False
+            for j in range(n):
+                if used[j]:
+                    continue
+                if expanded.intersects(items[j][0]):
+                    rect |= items[j][0]
+                    if items[j][1]:
+                        curves += 1
+                    total += 1
+                    used[j] = True
+                    added = True
+            if not added:
+                break
+        clusters.append((rect, curves, total))
+    return clusters
+
+
 def extract_blocks(pdf_path: Path) -> tuple[list[str], list[str]]:
     """PyMuPDF で各ページからテキストブロックを抽出.
 
     Returns:
         (本文ブロック列, 位置で検出したヘッダー/フッター候補列)
+
+    注: 'blocks' モードは異なる段組のテキストを 1 ブロックに併合してしまう
+    ことがあるため (例: 左の見出しと右のテーブルが同 y 位置で一体化される)、
+    'dict' モードを使い行レベルで bbox を取って図領域フィルタをかける。
+    その後、各論理ブロック内で生き残った行だけを束ね直してブロック化する。
     """
     doc = fitz.open(pdf_path)
     all_blocks: list[str] = []
@@ -128,15 +343,54 @@ def extract_blocks(pdf_path: Path) -> tuple[list[str], list[str]]:
         header_y = height * 0.08
         footer_y = height * 0.92
 
-        blocks = page.get_text("blocks")
-        text_blocks = [b for b in blocks if b[6] == 0]
+        figure_regions = get_figure_regions(page)
+        page_dict = page.get_text("dict")
 
-        # 位置によるヘッダー・フッター分離
+        # 行レベルで図領域フィルタをかけてブロックを再構築
+        rebuilt_blocks: list[tuple] = []  # (x0, y0, x1, y1, text)
+        for block in page_dict.get("blocks", []):
+            if block.get("type", 0) != 0:  # 0 = テキスト
+                continue
+            kept: list[tuple] = []  # (rect, text)
+            for line in block.get("lines", []):
+                line_bbox = line.get("bbox")
+                if line_bbox is None:
+                    continue
+                line_rect = fitz.Rect(line_bbox)
+                line_text = "".join(s.get("text", "") for s in line.get("spans", []))
+                if not line_text.strip():
+                    continue
+                # 行 bbox の 50% 超が図領域に重なる場合は除外
+                area = line_rect.get_area()
+                in_figure = False
+                if area > 0 and figure_regions:
+                    for r in figure_regions:
+                        inter = line_rect & r
+                        if not inter.is_empty and inter.get_area() / area > 0.5:
+                            in_figure = True
+                            break
+                if in_figure:
+                    continue
+                kept.append((line_rect, line_text))
+
+            if not kept:
+                continue
+            x0 = min(lr.x0 for lr, _ in kept)
+            y0 = min(lr.y0 for lr, _ in kept)
+            x1 = max(lr.x1 for lr, _ in kept)
+            y1 = max(lr.y1 for lr, _ in kept)
+            text = "\n".join(t.rstrip() for _, t in kept)
+            rebuilt_blocks.append((x0, y0, x1, y1, text))
+
+        # 位置によるヘッダー・フッター分離 / キャプション除外
         body_blocks = []
-        for b in text_blocks:
+        for b in rebuilt_blocks:
             y0, y1 = b[1], b[3]
             text = b[4].strip()
             if not text:
+                continue
+            # 図表キャプション (Figure 1, 図 1, Table 2 ...) → 除外
+            if CAPTION_START.match(text):
                 continue
             # 短い行 & 上下端 → ヘッダー/フッター候補
             if len(text) < 100 and "\n" not in text and (y1 < header_y or y0 > footer_y):
