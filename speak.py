@@ -6,6 +6,11 @@
     # Edge TTS（推奨・無料・高品質）
     python speak.py input.txt -o output.mp3 --backend edge --voice ja-JP-NanamiNeural
 
+    # --voice を省略 (auto) するとテキストの言語を判定して声を自動選択
+    #   日本語 → ja-JP-NanamiNeural / 英語 → en-US-AriaNeural (edge)
+    #   日本語 → Kyoko / 英語 → Samantha (say)
+    python speak.py input.txt -o output.mp3
+
     # macOS の say コマンド（ローカル完結）
     python speak.py input.txt -o output.aiff --backend say --voice Kyoko
 
@@ -20,6 +25,7 @@
 
 import argparse
 import asyncio
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +39,36 @@ EDGE_VOICES = {
     "en-natural-f": "en-US-AriaNeural",     # 英語 女性
     "en-natural-m": "en-US-GuyNeural",      # 英語 男性
 }
+
+# --voice auto のとき、言語判定の結果で選ぶデフォルトボイス（backend 別）
+DEFAULT_VOICES = {
+    "edge": {"ja": "ja-JP-NanamiNeural", "en": "en-US-AriaNeural"},
+    "say": {"ja": "Kyoko", "en": "Samantha"},
+}
+
+
+def detect_language(text: str) -> str:
+    """テキストが日本語か英語かを判定 (extract.py と同じ基準).
+
+    かな・漢字の文字数とラテン文字数を比較し、日本語文字が一定割合
+    以上あれば 'ja'、そうでなければ 'en' を返す。
+    """
+    ja = len(re.findall(r"[ぁ-んァ-ヶ一-龯]", text))
+    en = len(re.findall(r"[A-Za-z]", text))
+    if ja + en == 0:
+        return "en"
+    return "ja" if ja / (ja + en) > 0.2 else "en"
+
+
+def resolve_voice(voice: str, backend: str, text: str) -> str:
+    """--voice auto のとき、テキストの言語に応じたボイスを返す."""
+    if voice != "auto":
+        return voice
+    lang = detect_language(text)
+    table = DEFAULT_VOICES.get(backend, DEFAULT_VOICES["edge"])
+    chosen = table[lang]
+    print(f"  言語判定: {lang} → ボイス {chosen}")
+    return chosen
 
 
 async def speak_edge(text: str, out: Path, voice: str, rate: str = "+0%"):
@@ -118,7 +154,8 @@ def main() -> int:
         default="edge",
         help="TTS バックエンド",
     )
-    p.add_argument("--voice", default="ja-JP-NanamiNeural", help="ボイス名 (backend依存)")
+    p.add_argument("--voice", default="auto",
+                   help="ボイス名 (backend依存)。auto でテキストの言語に応じて自動選択")
     p.add_argument("--speaker", type=int, default=3, help="VOICEVOX のスピーカー ID")
     p.add_argument("--rate", default="+0%", help="話速 (edge: +20%%, say: 200 等)")
     p.add_argument("--ext", default="mp3", choices=["mp3", "wav", "aiff"],
@@ -168,13 +205,15 @@ def main() -> int:
 def _dispatch_backend(text: str, out: Path, args) -> None:
     """バックエンドを選んで音声合成を実行."""
     if args.backend == "edge":
-        asyncio.run(speak_edge(text, out, args.voice, args.rate))
+        voice = resolve_voice(args.voice, "edge", text)
+        asyncio.run(speak_edge(text, out, voice, args.rate))
     elif args.backend == "say":
+        voice = resolve_voice(args.voice, "say", text)
         try:
             rate = int(args.rate.replace("+", "").replace("%", "")) if "%" in args.rate else int(args.rate)
         except ValueError:
             rate = 200
-        speak_say(text, out, args.voice, rate)
+        speak_say(text, out, voice, rate)
     elif args.backend == "voicevox":
         speak_voicevox(text, out, args.speaker)
 

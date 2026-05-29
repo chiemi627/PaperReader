@@ -13,7 +13,7 @@
 5. 引用番号 [1], [2,3], (Smith 2020) 等を削除
 6. 図表キャプション (Figure 1, 図 1, Table 2 等で始まる段落) を除去
 7. 参考文献セクション以降を切り落とし
-8. 数式記号の多い行を除去
+8. 数式記号の多い行を「（ここに数式が入る）」/「(equation here)」に置換
 """
 
 import argparse
@@ -63,6 +63,12 @@ URL_PATTERN = re.compile(r"https?://\S+|doi:\s*\S+", re.IGNORECASE)
 
 # 数式記号が多い行（記号比率で判定）
 MATH_CHARS = set("∑∫∂∇√≤≥≠≈±∈∉⊂⊃∪∩∀∃→←↔⇒⇔αβγδεζηθικλμνξπρστυφχψω")
+
+# 数式行を置き換えるプレースホルダ（言語別）
+MATH_PLACEHOLDER = {
+    "ja": "（ここに数式が入る）",
+    "en": "(equation here)",
+}
 
 # 著者ブロックの判定材料
 AUTHOR_KEYWORDS = re.compile(
@@ -419,6 +425,19 @@ def extract_blocks(pdf_path: Path) -> tuple[list[str], list[str]]:
     return all_blocks, header_footer_candidates
 
 
+def detect_language(text: str) -> str:
+    """テキスト全体が日本語か英語かを判定.
+
+    かな・漢字の文字数とラテン文字数を比較し、日本語文字が一定割合
+    以上あれば 'ja'、そうでなければ 'en' を返す。
+    """
+    ja = len(re.findall(r"[ぁ-んァ-ヶ一-龯]", text))
+    en = len(re.findall(r"[A-Za-z]", text))
+    if ja + en == 0:
+        return "en"
+    return "ja" if ja / (ja + en) > 0.2 else "en"
+
+
 def looks_like_math(line: str) -> bool:
     """記号比率が高い行を数式と判定."""
     if len(line) < 5:
@@ -579,6 +598,9 @@ def clean_text(
     full = re.sub(r"\(\s*[.,;]\s*", "(", full)          # 括弧内の先頭の句読点
     full = re.sub(r"  +", " ", full)                    # 連続スペース
 
+    # 数式行のプレースホルダ（文書全体の言語で日英を切り替え）
+    math_placeholder = MATH_PLACEHOLDER[detect_language(full)]
+
     # 行レベル処理
     cleaned_lines = []
     for line in full.split("\n"):
@@ -587,6 +609,10 @@ def clean_text(
             cleaned_lines.append("")
             continue
         if looks_like_math(s):
+            # 連続する数式行はまとめて 1 つのプレースホルダにする
+            if cleaned_lines and cleaned_lines[-1] == math_placeholder:
+                continue
+            cleaned_lines.append(math_placeholder)
             continue
         # 句読点・括弧のみの行を除去
         if re.fullmatch(r"[\s\.\,\;\:\(\)\[\]\{\}\-—–\"'`、。「」（）]+", s):

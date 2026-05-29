@@ -41,14 +41,29 @@ pip install segno                       # QR コード表示 (serve.py 用)
 pip install requests                    # VOICEVOX を使う場合のみ
 ```
 
-## 基本フロー
+## いちばん簡単: 1 コマンドでまとめて実行
+
+`run.py` が下の 4 ステップ（抽出 → 音声化 → タグ付け → 任意で配信）を順番に実行します。
+
+```bash
+# PDF を渡すだけ。出力は paper/ ディレクトリにまとまる
+python run.py paper.pdf
+
+# 音声化したあと、そのまま Podcast 配信まで起動
+python run.py paper.pdf --serve
+```
+
+声は `--voice auto`（デフォルト）なので、**英語論文なら英語の声・日本語論文なら日本語の声**を自動で選びます。
+`--backend` / `--rate` / `--artist` などの個別オプションはそのまま各スクリプトに渡されます（`python run.py --help` 参照）。
+
+## 個別に実行する基本フロー
 
 ```bash
 # 1. PDF からセクション分割テキストを抽出
 python extract.py paper.pdf --split --stats
 
-# 2. 全セクションを音声化
-python speak.py paper/ --backend edge --voice ja-JP-NanamiNeural --ext mp3
+# 2. 全セクションを音声化（--voice 省略で言語に応じて自動選択）
+python speak.py paper/ --backend edge --ext mp3
 
 # 3. ID3 タグを付ける（iPhone での表示を整える）
 python tag.py paper/
